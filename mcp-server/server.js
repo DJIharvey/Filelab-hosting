@@ -1,7 +1,8 @@
 
 import express from "express";
+import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
 const app = express();
@@ -11,7 +12,26 @@ const PORT = process.env.PORT || 3000;
 const REPO = process.env.GITHUB_REPO || "DJIharvey/Filelab-hosting";
 const BRANCH = process.env.GITHUB_BRANCH || "ai-work";
 
-const sessions = new Map();
+function requireAuth(req, res, next) {
+  const expected = process.env.MCP_ACCESS_TOKEN;
+  const supplied = req.headers.authorization || "";
+
+  if (!expected) {
+    return res.status(503).json({ error: "Server authentication is not configured." });
+  }
+
+  const expectedBuffer = Buffer.from(`Bearer ${expected}`);
+  const suppliedBuffer = Buffer.from(supplied);
+
+  if (
+    expectedBuffer.length !== suppliedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+  ) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  next();
+}
 
 async function github(path) {
   const response = await fetch(
@@ -35,7 +55,7 @@ async function github(path) {
 function createServer() {
   const server = new McpServer({
     name: "filelab-ai-bridge",
-    version: "1.0.0"
+    version: "1.1.0"
   });
 
   server.tool(
@@ -130,43 +150,26 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "FileLab AI Bridge" });
 });
 
-app.get("/sse", async (_req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  const sessionId = transport.sessionId;
+app.all("/mcp", requireAuth, async (req, res) => {
+  const server = createServer();
 
-  sessions.set(sessionId, transport);
-
-  transport.onclose = () => {
-    sessions.delete(sessionId);
-  };
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true
+  });
 
   try {
-    await createServer().connect(transport);
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    sessions.delete(sessionId);
-    console.error("MCP connection error:", error);
-    if (!res.headersSent) res.status(500).end();
-  }
-});
+    console.error("MCP request error:", error);
 
-app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId;
-
-  if (typeof sessionId !== "string") {
-    return res.status(400).send("Missing session ID.");
-  }
-
-  const transport = sessions.get(sessionId);
-
-  if (!transport) {
-    return res.status(404).send("Session not found.");
-  }
-
-  try {
-    await transport.handlePostMessage(req, res, req.body);
-  } catch (error) {
-    console.error("MCP message error:", error);
-    if (!res.headersSent) res.status(500).end();
+    if (!res.headersSent) {
+      res.status(500).json({ error: "MCP request failed." });
+    }
+  } finally {
+    await transport.close().catch(() => {});
+    await server.close().catch(() => {});
   }
 });
 
