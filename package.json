@@ -1,0 +1,1 @@
+{"name":"filelab-hosting","version":"0.1.0","private":true,"type":"module","scripts":{"start":"node server.js"},"engines":{"node":">=20"},"dependencies":{"@supabase/supabase-js":"^2.57.0","adm-zip":"^0.5.16","express":"^5.1.0","helmet":"^8.1.0","mime-types":"^3.0.1"}}
