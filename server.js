@@ -1,44 +1,270 @@
 import express from "express";
 import helmet from "helmet";
-import {createClient} from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 import AdmZip from "adm-zip";
 import mime from "mime-types";
 import crypto from "node:crypto";
 
-for (const k of ["SUPABASE_URL","SUPABASE_SERVICE_ROLE_KEY","FILELAB_ADMIN_PASSWORD"]) if (!process.env[k]) throw new Error("Missing "+k);
-const db=createClient(process.env.SUPABASE_URL,process.env.SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:false}});
-const app=express(), BUCKET="filelab-sites", MAX=100*1024*1024;
-app.disable("x-powered-by"); app.use(helmet({contentSecurityPolicy:false})); app.use(express.json({limit:"140mb"})); app.use(express.static("public"));
-const equal=(a,b)=>{a=Buffer.from(String(a));b=Buffer.from(String(b));return a.length===b.length&&crypto.timingSafeEqual(a,b)};
-function admin(req,res,next){const h=req.get("authorization")||"";if(!equal(h.startsWith("Bearer ")?h.slice(7):"",process.env.FILELAB_ADMIN_PASSWORD))return res.status(401).json({error:"Sign in required"});next()}
-const slug=s=>String(s||"site").toLowerCase().replace(/[^a-z0-9-]+/g,"-").replace(/^-|-$/g,"").slice(0,40)||"site";
-function safePath(s){s=String(s).replace(/\\/g,"/").replace(/^\/+/,"");const p=s.split("/");return s.length<=240&&!p.some(x=>!x||x==="."||x==="..")?s:null}
-app.get("/healthz",(_,r)=>r.json({ok:true,service:"FileLab Hosting"}));
-app.post("/api/login",(q,r)=>equal(q.body?.password,process.env.FILELAB_ADMIN_PASSWORD)?r.json({token:process.env.FILELAB_ADMIN_PASSWORD}):r.status(401).json({error:"Incorrect password"}));
-app.get("/api/sites",admin,async(q,r)=>{const x=await db.from("filelab_sites").select("id,slug,name,file_count,total_bytes,status,created_at").order("created_at",{ascending:false});if(x.error)return r.status(500).json({error:x.error.message});r.json({sites:x.data})});
-app.post("/api/sites",admin,async(q,r)=>{const name=String(q.body?.name||"").trim().slice(0,100);if(!name)return r.status(400).json({error:"Enter a name"});const x=await db.from("filelab_sites").insert({name,slug:slug(q.body.slug||name)+"-"+crypto.randomBytes(3).toString("hex"),storage_prefix:"sites/"+crypto.randomUUID(),status:"draft"}).select("id,slug,name,status").single();if(x.error)return r.status(500).json({error:x.error.message});r.status(201).json({site:x.data})});
-app.post("/api/sites/:id/deploy",admin,async(q,r)=>{
- let buf;try{buf=Buffer.from(q.body.zipBase64,"base64")}catch{return r.status(400).json({error:"Invalid ZIP"})}
- if(!buf?.length||buf.length>MAX)return r.status(413).json({error:"ZIP must be under 100 MB"});
- const s=await db.from("filelab_sites").select("id,slug,storage_prefix").eq("id",q.params.id).single();if(s.error)return r.status(404).json({error:"Site not found"});
- let entries;try{entries=new AdmZip(buf).getEntries().filter(e=>!e.isDirectory)}catch{return r.status(400).json({error:"Cannot read ZIP"})}
- if(!entries.length||entries.length>1500)return r.status(400).json({error:"ZIP must contain 1–1,500 files"});
- const files=[];let total=0;for(const e of entries){const p=safePath(e.entryName);if(!p)return r.status(400).json({error:"Unsafe ZIP path"});const data=e.getData();total+=data.length;if(total>250*1024*1024)return r.status(413).json({error:"Expanded files exceed 250 MB"});files.push({path:p,data})}
- if(!files.some(f=>f.path.toLowerCase()==="index.html"))return r.status(400).json({error:"Put index.html at the ZIP root"});
- const prefix=s.data.storage_prefix+"/v-"+Date.now()+"-"+crypto.randomBytes(3).toString("hex"), uploaded=[];
- for(const f of files){const key=prefix+"/"+f.path;const u=await db.storage.from(BUCKET).upload(key,f.data,{contentType:mime.lookup(f.path)||"application/octet-stream"});if(u.error){if(uploaded.length)await db.storage.from(BUCKET).remove(uploaded);return r.status(502).json({error:u.error.message})}uploaded.push(key)}
- const rows=files.map(f=>({site_id:s.data.id,path:f.path,content_type:mime.lookup(f.path)||"application/octet-stream",size_bytes:f.data.length}));
- const del=await db.from("filelab_site_files").delete().eq("site_id",s.data.id);if(del.error)return r.status(500).json({error:del.error.message});
- const ins=await db.from("filelab_site_files").insert(rows);if(ins.error)return r.status(500).json({error:ins.error.message});
- const up=await db.from("filelab_sites").update({storage_prefix:prefix,file_count:files.length,total_bytes:total,status:"published",deployed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",s.data.id);if(up.error)return r.status(500).json({error:up.error.message});
- r.json({ok:true,files:files.length,bytes:total,url:"/s/"+s.data.slug+"/"});
+for (const key of [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "FILELAB_ADMIN_PASSWORD"
+]) {
+  if (!process.env[key]) {
+    throw new Error("Missing " + key);
+  }
+}
+
+const db = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false } }
+);
+const app = express();
+const BUCKET = "filelab-sites";
+const MAX = 100 * 1024 * 1024;
+
+app.disable("x-powered-by");
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: "140mb" }));
+app.use(express.static("public"));
+
+const equal = (a, b) => {
+  a = Buffer.from(String(a));
+  b = Buffer.from(String(b));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+
+function admin(req, res, next) {
+  const header = req.get("authorization") || "";
+  if (
+    !equal(
+      header.startsWith("Bearer ") ? header.slice(7) : "",
+      process.env.FILELAB_ADMIN_PASSWORD
+    )
+  ) {
+    return res.status(401).json({ error: "Sign in required" });
+  }
+  next();
+}
+
+const slug = (value) =>
+  String(value || "site")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40) || "site";
+
+function safePath(value) {
+  const path = String(value)
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+  const parts = path.split("/");
+  return path.length <= 240 &&
+    !parts.some((part) => !part || part === "." || part === "..")
+    ? path
+    : null;
+}
+
+app.get("/healthz", (_, res) =>
+  res.json({ ok: true, service: "FileLab Hosting" })
+);
+
+app.post("/api/login", (req, res) =>
+  equal(req.body?.password, process.env.FILELAB_ADMIN_PASSWORD)
+    ? res.json({ token: process.env.FILELAB_ADMIN_PASSWORD })
+    : res.status(401).json({ error: "Incorrect password" })
+);
+
+app.get("/api/sites", admin, async (req, res) => {
+  const result = await db
+    .from("filelab_sites")
+    .select("id,slug,name,file_count,total_bytes,status,created_at")
+    .order("created_at", { ascending: false });
+  if (result.error) {
+    return res.status(500).json({ error: result.error.message });
+  }
+  res.json({ sites: result.data });
 });
-app.get("/s/:slug/*path",async(q,r)=>{
- const s=await db.from("filelab_sites").select("id,storage_prefix,status").eq("slug",q.params.slug).single();if(s.error||s.data.status!=="published")return r.status(404).send("Site not found");
- let p=Array.isArray(q.params.path)?q.params.path.join("/"):"index.html";p=safePath(decodeURIComponent(p||"index.html"))||"index.html";
- let f=await db.from("filelab_site_files").select("path,content_type").eq("site_id",s.data.id).eq("path",p).maybeSingle();if(f.error||!f.data)return r.status(404).send("File not found");
- const d=await db.storage.from(BUCKET).download(s.data.storage_prefix+"/"+f.data.path);if(d.error)return r.status(502).send("Storage read failed");
- r.set("Content-Type",f.data.content_type).set("Cache-Control","public,max-age=60").send(Buffer.from(await d.data.arrayBuffer()));
+
+app.post("/api/sites", admin, async (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 100);
+  if (!name) {
+    return res.status(400).json({ error: "Enter a name" });
+  }
+
+  const result = await db
+    .from("filelab_sites")
+    .insert({
+      name,
+      slug: slug(req.body.slug || name) + "-" + crypto.randomBytes(3).toString("hex"),
+      storage_prefix: "sites/" + crypto.randomUUID(),
+      status: "draft"
+    })
+    .select("id,slug,name,status")
+    .single();
+  if (result.error) {
+    return res.status(500).json({ error: result.error.message });
+  }
+  res.status(201).json({ site: result.data });
 });
-app.get("/s/:slug",(q,r)=>r.redirect("/s/"+encodeURIComponent(q.params.slug)+"/"));
-app.listen(process.env.PORT||3000,"0.0.0.0",()=>console.log("FileLab Hosting ready"));
+
+app.post("/api/sites/:id/deploy", admin, async (req, res) => {
+  let buffer;
+  try {
+    buffer = Buffer.from(req.body.zipBase64, "base64");
+  } catch {
+    return res.status(400).json({ error: "Invalid ZIP" });
+  }
+  if (!buffer?.length || buffer.length > MAX) {
+    return res.status(413).json({ error: "ZIP must be under 100 MB" });
+  }
+
+  const site = await db
+    .from("filelab_sites")
+    .select("id,slug,storage_prefix")
+    .eq("id", req.params.id)
+    .single();
+  if (site.error) {
+    return res.status(404).json({ error: "Site not found" });
+  }
+
+  let entries;
+  try {
+    entries = new AdmZip(buffer).getEntries().filter((entry) => !entry.isDirectory);
+  } catch {
+    return res.status(400).json({ error: "Cannot read ZIP" });
+  }
+  if (!entries.length || entries.length > 1500) {
+    return res.status(400).json({ error: "ZIP must contain 1–1,500 files" });
+  }
+
+  const files = [];
+  let total = 0;
+  for (const entry of entries) {
+    const path = safePath(entry.entryName);
+    if (!path) {
+      return res.status(400).json({ error: "Unsafe ZIP path" });
+    }
+    const data = entry.getData();
+    total += data.length;
+    if (total > 250 * 1024 * 1024) {
+      return res.status(413).json({ error: "Expanded files exceed 250 MB" });
+    }
+    files.push({ path, data });
+  }
+
+  if (!files.some((file) => file.path.toLowerCase() === "index.html")) {
+    return res.status(400).json({ error: "Put index.html at the ZIP root" });
+  }
+
+  const prefix =
+    site.data.storage_prefix +
+    "/v-" +
+    Date.now() +
+    "-" +
+    crypto.randomBytes(3).toString("hex");
+  const uploaded = [];
+
+  for (const file of files) {
+    const key = prefix + "/" + file.path;
+    const result = await db.storage.from(BUCKET).upload(key, file.data, {
+      contentType: mime.lookup(file.path) || "application/octet-stream"
+    });
+    if (result.error) {
+      if (uploaded.length) {
+        await db.storage.from(BUCKET).remove(uploaded);
+      }
+      return res.status(502).json({ error: result.error.message });
+    }
+    uploaded.push(key);
+  }
+
+  const rows = files.map((file) => ({
+    site_id: site.data.id,
+    path: file.path,
+    content_type: mime.lookup(file.path) || "application/octet-stream",
+    size_bytes: file.data.length
+  }));
+  const deleted = await db
+    .from("filelab_site_files")
+    .delete()
+    .eq("site_id", site.data.id);
+  if (deleted.error) {
+    return res.status(500).json({ error: deleted.error.message });
+  }
+
+  const inserted = await db.from("filelab_site_files").insert(rows);
+  if (inserted.error) {
+    return res.status(500).json({ error: inserted.error.message });
+  }
+
+  const updated = await db
+    .from("filelab_sites")
+    .update({
+      storage_prefix: prefix,
+      file_count: files.length,
+      total_bytes: total,
+      status: "published",
+      deployed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", site.data.id);
+  if (updated.error) {
+    return res.status(500).json({ error: updated.error.message });
+  }
+
+  res.json({
+    ok: true,
+    files: files.length,
+    bytes: total,
+    url: "/s/" + site.data.slug + "/"
+  });
+});
+
+app.get("/s/:slug/*path", async (req, res) => {
+  const site = await db
+    .from("filelab_sites")
+    .select("id,storage_prefix,status")
+    .eq("slug", req.params.slug)
+    .single();
+  if (site.error || site.data.status !== "published") {
+    return res.status(404).send("Site not found");
+  }
+
+  let path = Array.isArray(req.params.path)
+    ? req.params.path.join("/")
+    : "index.html";
+  path =
+    safePath(decodeURIComponent(path || "index.html")) || "index.html";
+
+  const file = await db
+    .from("filelab_site_files")
+    .select("path,content_type")
+    .eq("site_id", site.data.id)
+    .eq("path", path)
+    .maybeSingle();
+  if (file.error || !file.data) {
+    return res.status(404).send("File not found");
+  }
+
+  const download = await db.storage
+    .from(BUCKET)
+    .download(site.data.storage_prefix + "/" + file.data.path);
+  if (download.error) {
+    return res.status(502).send("Storage read failed");
+  }
+
+  res
+    .set("Content-Type", file.data.content_type)
+    .set("Cache-Control", "public,max-age=60")
+    .send(Buffer.from(await download.data.arrayBuffer()));
+});
+
+app.get("/s/:slug", (req, res) =>
+  res.redirect("/s/" + encodeURIComponent(req.params.slug) + "/")
+);
+
+app.listen(process.env.PORT || 3000, "0.0.0.0", () =>
+  console.log("FileLab Hosting ready")
+);
