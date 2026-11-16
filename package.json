@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
-    "adm-zip": "^0.5.16",
+    "adm-zip": "^0.6.1",
     "express": "^4.21.2",
     "helmet": "^8.0.0",
     "mime-types": "^2.0.0"
