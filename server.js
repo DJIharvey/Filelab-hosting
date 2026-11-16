@@ -23,6 +23,9 @@ const db = createClient(
 const app = express();
 const BUCKET = "filelab-sites";
 const MAX = 100 * 1024 * 1024;
+const SESSION_COOKIE = "filelab_session";
+const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
+const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_SECONDS * 1000;
 
 app.disable("x-powered-by");
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -35,17 +38,53 @@ const equal = (a, b) => {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
-function admin(req, res, next) {
-  const header = req.get("authorization") || "";
-  if (
-    !equal(
-      header.startsWith("Bearer ") ? header.slice(7) : "",
-      process.env.FILELAB_ADMIN_PASSWORD
-    )
-  ) {
+const hashSessionToken = (token) =>
+  crypto.createHash("sha256").update(token).digest("hex");
+
+function sessionTokenFromRequest(req) {
+  const cookieHeader = req.get("cookie") || "";
+  for (const part of cookieHeader.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim() === SESSION_COOKIE) {
+      return part.slice(separator + 1).trim();
+    }
+  }
+  return "";
+}
+
+function clearSessionCookie(res) {
+  res.set(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`
+  );
+}
+
+async function admin(req, res, next) {
+  const token = sessionTokenFromRequest(req);
+  if (!/^[A-Za-z0-9_-]{40,}$/.test(token)) {
     return res.status(401).json({ error: "Sign in required" });
   }
-  next();
+
+  try {
+    const session = await db
+      .from("filelab_admin_sessions")
+      .select("id")
+      .eq("token_hash", hashSessionToken(token))
+      .is("revoked_at", null)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle();
+
+    if (session.error) {
+      return res.status(500).json({ error: "Could not validate session" });
+    }
+    if (!session.data) {
+      return res.status(401).json({ error: "Sign in required" });
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
 }
 
 const slug = (value) =>
@@ -70,11 +109,52 @@ app.get("/healthz", (_, res) =>
   res.json({ ok: true, service: "FileLab Hosting" })
 );
 
-app.post("/api/login", (req, res) =>
-  equal(req.body?.password, process.env.FILELAB_ADMIN_PASSWORD)
-    ? res.json({ token: process.env.FILELAB_ADMIN_PASSWORD })
-    : res.status(401).json({ error: "Incorrect password" })
-);
+app.post("/api/login", async (req, res) => {
+  if (!equal(req.body?.password, process.env.FILELAB_ADMIN_PASSWORD)) {
+    return res.status(401).json({ error: "Incorrect password" });
+  }
+
+  const token = crypto.randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + SESSION_MAX_AGE_MS).toISOString();
+  const session = await db.from("filelab_admin_sessions").insert({
+    token_hash: hashSessionToken(token),
+    expires_at: expiresAt
+  });
+
+  if (session.error) {
+    return res.status(500).json({ error: "Could not create session" });
+  }
+
+  res.set(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`
+  );
+  res.json({ ok: true });
+});
+
+app.post("/api/logout", async (req, res) => {
+  const token = sessionTokenFromRequest(req);
+  let revokeError = null;
+
+  if (/^[A-Za-z0-9_-]{40,}$/.test(token)) {
+    try {
+      const revoked = await db
+        .from("filelab_admin_sessions")
+        .update({ revoked_at: new Date().toISOString() })
+        .eq("token_hash", hashSessionToken(token))
+        .is("revoked_at", null);
+      revokeError = revoked.error;
+    } catch (error) {
+      revokeError = error;
+    }
+  }
+
+  clearSessionCookie(res);
+  if (revokeError) {
+    return res.status(500).json({ error: "Could not revoke session" });
+  }
+  res.json({ ok: true });
+});
 
 app.get("/api/sites", admin, async (req, res) => {
   const result = await db
