@@ -1,9 +1,7 @@
 const appRoot = document.getElementById('app');
 const toastRoot = document.getElementById('toast-region');
-const storageKey = 'filelab-admin-token';
 
 const state = {
-  token: localStorage.getItem(storageKey) || '',
   sites: []
 };
 
@@ -51,14 +49,8 @@ const showToast = (message, type = 'info') => {
 };
 
 async function apiRequest(path, options = {}) {
-  const headers = new Headers(options.headers || {});
-  if (state.token) {
-    headers.set('Authorization', `Bearer ${state.token}`);
-  }
-
   const response = await fetch(path, {
     ...options,
-    headers,
     credentials: 'same-origin'
   });
 
@@ -73,34 +65,47 @@ async function apiRequest(path, options = {}) {
   }
 
   if (!response.ok) {
+    if (response.status === 401 && path !== '/api/login') {
+      state.sites = [];
+      renderLogin();
+    }
     const message = (payload && payload.error) || `Request failed (${response.status})`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
 
   return payload ?? {};
 }
 
 async function login(password) {
-  const result = await apiRequest('/api/login', {
+  return apiRequest('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password })
   });
-
-  if (!result.token) {
-    throw new Error('Login succeeded but the server did not return a bearer token.');
-  }
-
-  state.token = result.token;
-  localStorage.setItem(storageKey, state.token);
-  return result;
 }
 
 async function logout() {
-  state.token = '';
-  localStorage.removeItem(storageKey);
-  renderLogin();
-  showToast('Signed out.', 'info');
+  const button = document.getElementById('logout-button');
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Signing out…';
+  }
+
+  try {
+    await apiRequest('/api/logout', { method: 'POST' });
+    state.sites = [];
+    renderLogin();
+    showToast('Signed out.', 'info');
+  } catch (error) {
+    showToast(error.message || 'Could not sign out. Please try again.', 'error');
+    const currentButton = document.getElementById('logout-button');
+    if (currentButton) {
+      currentButton.disabled = false;
+      currentButton.textContent = 'Sign out';
+    }
+  }
 }
 
 async function loadSites() {
@@ -275,29 +280,27 @@ function renderLogin() {
   const form = document.getElementById('login-form');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const password = document.getElementById('admin-password').value;
+    const passwordInput = document.getElementById('admin-password');
+    const password = passwordInput.value;
     const submitButton = form.querySelector('button[type="submit"]');
     submitButton.disabled = true;
     submitButton.textContent = 'Signing in…';
 
     try {
       await login(password);
+      passwordInput.value = '';
       await loadSites();
     } catch (error) {
       showToast(error.message || 'Incorrect password.', 'error');
-    } finally {
-      submitButton.disabled = false;
-      submitButton.textContent = 'Sign in';
+      if (error.status !== 401) {
+        submitButton.disabled = false;
+        submitButton.textContent = 'Sign in';
+      }
     }
   });
 }
 
 function renderDashboard() {
-  if (!state.token) {
-    renderLogin();
-    return;
-  }
-
   const siteCards = state.sites.map((site) => {
     const url = `${window.location.origin}/s/${site.slug}/`;
     return `
@@ -430,18 +433,14 @@ function renderDashboard() {
 }
 
 async function initialize() {
-  if (!state.token) {
-    renderLogin();
-    return;
-  }
-
   try {
     await loadSites();
   } catch (error) {
-    showToast(error.message || 'Unable to load the dashboard.', 'error');
-    state.token = '';
-    localStorage.removeItem(storageKey);
+    state.sites = [];
     renderLogin();
+    if (error.status !== 401) {
+      showToast(error.message || 'Unable to verify your sign-in. Please try again.', 'error');
+    }
   }
 }
 
