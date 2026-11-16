@@ -51,7 +51,8 @@ test('server stores only random session token hashes and sets secure cookie attr
   assert.match(server, /crypto\.createHash\("sha256"\)\.update\(token\)\.digest\("hex"\)/);
   assert.match(server, /token_hash:\s*hashSessionToken\(token\)/);
   assert.match(server, /filelab_admin_sessions/);
-  assert.match(server, /filelab_session=\$\{token\}; HttpOnly; Secure; SameSite=Lax; Path=\//);
+  assert.match(server, /SESSION_COOKIE\s*=\s*"filelab_session"/);
+  assert.match(server, /\$\{SESSION_COOKIE\}=\$\{token\};\s*HttpOnly;\s*Secure;\s*SameSite=Lax;\s*Path=\//);
   assert.match(server, /SESSION_MAX_AGE_SECONDS\s*=\s*12\s*\*\s*60\s*\*\s*60/);
   assert.match(server, /\.is\("revoked_at",\s*null\)/);
   assert.match(server, /\.gt\("expires_at",\s*new Date\(\)\.toISOString\(\)\)/);
