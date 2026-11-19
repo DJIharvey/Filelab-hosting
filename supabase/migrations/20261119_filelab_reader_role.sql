@@ -21,8 +21,16 @@
 -- If you skip this, leave SUPABASE_READER_KEY unset.
 --
 -- Do not put either key in frontend code.
+--
+-- Idempotent: safe to re-run. PostgreSQL has no CREATE ROLE IF NOT EXISTS,
+-- so the role is created only when pg_roles does not already contain it.
 
-CREATE ROLE IF NOT EXISTS filelab_reader NOLOGIN;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'filelab_reader') THEN
+    CREATE ROLE filelab_reader NOLOGIN;
+  END IF;
+END $$;
 
 GRANT USAGE ON SCHEMA public TO filelab_reader;
 GRANT SELECT ON TABLE public.filelab_sites TO filelab_reader;

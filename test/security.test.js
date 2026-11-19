@@ -82,7 +82,6 @@ function makeAdminMock() {
         if (name !== "filelab_activate_deployment") return { error: { message: "unknown rpc" } };
         const site = sites.get(args.p_site_id);
         if (!site) return { error: { message: "site not found" } };
-        // Atomic: replace file metadata and switch prefix together.
         files.set(args.p_site_id, new Map());
         for (const f of args.p_files) {
           files.get(args.p_site_id).set(f.path, f);
@@ -250,6 +249,8 @@ describe("rate limiting", () => {
 
 describe("deploy safety", () => {
   test("duplicate ZIP paths return 400", async () => {
+    loginLimiter.reset();
+    deployLimiter.reset();
     const mock = makeAdminMock();
     mock.addSite("s1", "mysite", "published", "sites/s1/old");
     mock.addFile("s1", "index.html", "<h1>old</h1>");
@@ -261,7 +262,6 @@ describe("deploy safety", () => {
     });
     const raw = Array.isArray(login.setCookie) ? login.setCookie[0] : String(login.setCookie);
     const cookie = raw.split(";")[0];
-    // Real ZIP with two entries named index.html (adm-zip collapses on addFile, so we use a prebuilt archive).
     const dupZipB64 = "UEsDBBQAAAAAAAaoc10BEhXZCgAAAAoAAAAKAAAAaW5kZXguaHRtbDxoMT5hPC9oMT5QSwMEFAAAAAAABqhzXa9ggV8KAAAACgAAAAoAAABpbmRleC5odG1sPGgxPmI8L2gxPlBLAQIUAxQAAAAAAAaoc10BEhXZCgAAAAoAAAAKAAAAAAAAAAAAAACAAQAAAABpbmRleC5odG1sUEsBAhQDFAAAAAAABqhzXa9ggV8KAAAACgAAAAoAAAAAAAAAAAAAAIABMgAAAGluZGV4Lmh0bWxQSwUGAAAAAAIAAgBwAAAAZAAAAAAA";
     const res = await request(app, "/api/sites/s1/deploy", {
       method: "POST",
@@ -276,6 +276,8 @@ describe("deploy safety", () => {
   });
 
   test("failed metadata insertion preserves previous version", async () => {
+    loginLimiter.reset();
+    deployLimiter.reset();
     const mock = makeAdminMock();
     mock.addSite("s1", "mysite", "published", "sites/s1/old");
     mock.addFile("s1", "index.html", "<h1>old</h1>");
@@ -305,6 +307,8 @@ describe("deploy safety", () => {
   });
 
   test("failed active-version switching preserves previous version", async () => {
+    loginLimiter.reset();
+    deployLimiter.reset();
     const mock = makeAdminMock();
     mock.addSite("s1", "mysite", "published", "sites/s1/old");
     mock.addFile("s1", "index.html", "<h1>old</h1>");
@@ -332,6 +336,8 @@ describe("deploy safety", () => {
   });
 
   test("failed upload preserves previous version", async () => {
+    loginLimiter.reset();
+    deployLimiter.reset();
     const mock = makeAdminMock();
     mock.addSite("s1", "mysite", "published", "sites/s1/old");
     mock.addFile("s1", "index.html", "<h1>old</h1>");
@@ -422,5 +428,33 @@ describe("no secrets in frontend", () => {
     const index = await fs.readFile("public/index.html", "utf8");
     assert.doesNotMatch(appJs, /SERVICE_ROLE|service_role|SUPABASE_/);
     assert.doesNotMatch(index, /SERVICE_ROLE|service_role/);
+  });
+});
+
+describe("migration SQL", () => {
+  test("reader migration uses idempotent DO block, not CREATE ROLE IF NOT EXISTS", async () => {
+    const fs = await import("node:fs/promises");
+    const sql = await fs.readFile("supabase/migrations/20261119_filelab_reader_role.sql", "utf8");
+    const executable = sql.replace(/--[^\n]*/g, "");
+    assert.doesNotMatch(executable, /CREATE\s+ROLE\s+IF\s+NOT\s+EXISTS/i);
+    assert.match(sql, /pg_roles/);
+    assert.match(sql, /CREATE ROLE filelab_reader NOLOGIN/);
+    assert.match(sql, /IF NOT EXISTS \(SELECT 1 FROM pg_roles WHERE rolname = 'filelab_reader'\)/);
+    assert.match(sql, /GRANT SELECT ON TABLE public\.filelab_sites TO filelab_reader/);
+    assert.match(sql, /GRANT SELECT ON TABLE public\.filelab_site_files TO filelab_reader/);
+    assert.match(sql, /table_name = 'filelab_deployments'/);
+    assert.doesNotMatch(sql, /CREATE POLICY|storage\.objects/i);
+  });
+
+  test("atomic migration creates deployments before any reader grant and serializes with FOR UPDATE", async () => {
+    const fs = await import("node:fs/promises");
+    const sql = await fs.readFile("supabase/migrations/20261119_atomic_deployments.sql", "utf8");
+    const createPos = sql.indexOf("CREATE TABLE IF NOT EXISTS public.filelab_deployments");
+    const grantPos = sql.indexOf("GRANT SELECT ON TABLE public.filelab_deployments TO filelab_reader");
+    assert.ok(createPos > 0);
+    assert.ok(grantPos > createPos);
+    assert.match(sql, /FOR UPDATE/);
+    assert.match(sql, /filelab_activate_deployment/);
+    assert.match(sql, /pg_roles WHERE rolname = 'filelab_reader'/);
   });
 });
