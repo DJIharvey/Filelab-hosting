@@ -5,13 +5,8 @@ import mime from "mime-types";
 
 const BUCKET = "filelab-sites";
 
-/**
- * Strict path validation for public serving.
- * Rejects traversal, encoded traversal, null bytes, absolute paths, etc.
- */
 export function safePublicPath(raw) {
   if (typeof raw !== "string") return null;
-  // Reject absolute paths and obvious traversal before any decode
   if (raw.startsWith("/") || raw.startsWith("\\") || raw.includes("..")) return null;
 
   let s = raw;
@@ -21,7 +16,6 @@ export function safePublicPath(raw) {
     return null;
   }
 
-  // Reject encoded traversal patterns and anything that becomes dangerous after decode
   if (/%2e%2e|%2f|%5c/i.test(raw) || s.includes("..") || s.includes("\0")) return null;
 
   s = s.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -32,6 +26,11 @@ export function safePublicPath(raw) {
   if (parts.some(part => part.includes("%"))) return null;
 
   return s;
+}
+
+function logError(msg, err) {
+  const detail = err && err.message ? err.message : String(err || "");
+  console.error("[filelab-public]", msg, detail.slice(0, 200));
 }
 
 async function serveFile(db, slug, path, res) {
@@ -64,6 +63,7 @@ async function serveFile(db, slug, path, res) {
   const key = site.storage_prefix + "/" + fileRes.data.path;
   const dl = await db.storage.from(BUCKET).download(key);
   if (dl.error || !dl.data) {
+    logError("storage download", dl.error);
     return res.status(502).send("Storage read failed");
   }
 
@@ -80,9 +80,11 @@ async function serveFile(db, slug, path, res) {
 }
 
 export function createPublicApp(dbClient) {
-  const db = dbClient || createClient(process.env.SUPABASE_URL || "", process.env.SUPABASE_SERVICE_ROLE_KEY || "", { auth: { persistSession: false } });
-  const app = express();
+  const url = process.env.SUPABASE_URL || "";
+  const key = process.env.SUPABASE_READER_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+  const db = dbClient || createClient(url, key, { auth: { persistSession: false } });
 
+  const app = express();
   app.disable("x-powered-by");
   app.use(helmet({
     contentSecurityPolicy: false,
@@ -92,13 +94,11 @@ export function createPublicApp(dbClient) {
 
   app.get("/healthz", (_, res) => res.json({ ok: true, service: "FileLab Public Hosting" }));
 
-  // Bare slug and trailing-slash both serve index.html (Express treats them similarly)
   app.get("/s/:slug", async (req, res) => {
     const slug = String(req.params.slug || "").toLowerCase();
     await serveFile(db, slug, "index.html", res);
   });
 
-  // Nested paths
   app.get("/s/:slug/*path", async (req, res) => {
     const slug = String(req.params.slug || "").toLowerCase();
     let path = Array.isArray(req.params.path) ? req.params.path.join("/") : (req.params.path || "");
@@ -106,7 +106,6 @@ export function createPublicApp(dbClient) {
     await serveFile(db, slug, path, res);
   });
 
-  // No admin or API routes
   app.use((req, res) => {
     if (req.path.startsWith("/api") || req.path.startsWith("/admin")) {
       return res.status(404).json({ error: "Not found" });
@@ -117,10 +116,12 @@ export function createPublicApp(dbClient) {
   return app;
 }
 
-// Start if run directly
 if (import.meta.url === `file://${process.argv[1]}`) {
-  for (const k of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]) {
+  for (const k of ["SUPABASE_URL"]) {
     if (!process.env[k]) throw new Error("Missing " + k);
+  }
+  if (!process.env.SUPABASE_READER_KEY && !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Missing SUPABASE_READER_KEY or SUPABASE_SERVICE_ROLE_KEY");
   }
   const app = createPublicApp();
   const port = process.env.PORT || 3001;

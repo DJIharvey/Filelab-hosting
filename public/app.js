@@ -1,13 +1,14 @@
-let token = "";
 let publicOrigin = "";
 
 const $ = id => document.getElementById(id);
 const note = t => { $("notice").textContent = t; };
 
 async function api(url, opt = {}) {
+  const headers = { ...(opt.headers || {}), "X-FileLab-Request": "1" };
   const r = await fetch(url, {
     ...opt,
-    headers: { ...(opt.headers || {}), ...(token ? { Authorization: "Bearer " + token } : {}) }
+    credentials: "include",
+    headers
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw Error(j.error || "Request failed");
@@ -24,11 +25,11 @@ async function loadConfig() {
 $("loginForm").onsubmit = async e => {
   e.preventDefault();
   try {
-    token = (await api("/api/login", {
+    await api("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: $("password").value })
-    })).token;
+    });
     $("login").hidden = true;
     $("dash").hidden = false;
     await loadConfig();
@@ -38,8 +39,8 @@ $("loginForm").onsubmit = async e => {
   }
 };
 
-$("logout").onclick = () => {
-  token = "";
+$("logout").onclick = async () => {
+  try { await api("/api/logout", { method: "POST" }); } catch { /* ignore */ }
   $("dash").hidden = true;
   $("login").hidden = false;
 };
