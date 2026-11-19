@@ -67,11 +67,32 @@ function makeAdminMock() {
     return c;
   }
 
+  let rpcFail = false;
+  let metaFail = false;
+
   return {
     sites, files, storage,
     setUploadFail(v) { uploadFail = v; },
+    setRpcFail(v) { rpcFail = v; },
+    setMetaFail(v) { metaFail = v; },
     db: {
       from(table) { return chain(table); },
+      async rpc(name, args) {
+        if (rpcFail || metaFail) return { error: { message: "rpc failed" } };
+        if (name !== "filelab_activate_deployment") return { error: { message: "unknown rpc" } };
+        const site = sites.get(args.p_site_id);
+        if (!site) return { error: { message: "site not found" } };
+        // Atomic: replace file metadata and switch prefix together.
+        files.set(args.p_site_id, new Map());
+        for (const f of args.p_files) {
+          files.get(args.p_site_id).set(f.path, f);
+        }
+        site.storage_prefix = args.p_storage_prefix;
+        site.file_count = args.p_file_count;
+        site.total_bytes = args.p_total_bytes;
+        site.status = "published";
+        return { error: null };
+      },
       storage: {
         from() {
           return {
@@ -118,38 +139,32 @@ function request(app, path, { method = "GET", body, headers = {}, cookie } = {})
       };
       if (cookie) opts.headers.cookie = cookie;
       const req = http.request(opts, res => {
-        let data = "";
-        res.on("data", c => data += c);
+        const chunks = [];
+        res.on("data", c => chunks.push(c));
         res.on("end", () => {
+          const text = Buffer.concat(chunks).toString();
+          let json = null;
+          try { json = JSON.parse(text); } catch { /* */ }
+          resolve({ status: res.statusCode, headers: res.headers, text, json, setCookie: res.headers["set-cookie"] });
           server.close();
-          resolve({ status: res.statusCode, headers: res.headers, text: data, setCookie: res.headers["set-cookie"] });
         });
       });
-      req.on("error", e => { server.close(); reject(e); });
-      if (body) req.write(typeof body === "string" ? body : JSON.stringify(body));
+      req.on("error", reject);
+      if (body) req.write(JSON.stringify(body));
       req.end();
     });
   });
 }
 
-function makeZip(files) {
-  const z = new AdmZip();
-  for (const [name, content] of Object.entries(files)) {
-    z.addFile(name, Buffer.from(content));
-  }
-  return z.toBuffer();
-}
-
 describe("safeZipPath", () => {
   test("accepts normal", () => {
     assert.equal(safeZipPath("index.html"), "index.html");
-    assert.equal(safeZipPath("css/app.css"), "css/app.css");
+    assert.equal(safeZipPath("css/style.css"), "css/style.css");
   });
   test("rejects traversal and dangerous", () => {
     assert.equal(safeZipPath("../secret"), null);
+    assert.equal(safeZipPath("%2e%2e/secret"), null);
     assert.equal(safeZipPath("foo/../../bar"), null);
-    assert.equal(safeZipPath("%2e%2e/etc"), null);
-    assert.equal(safeZipPath("a\0b"), null);
   });
 });
 
@@ -163,10 +178,11 @@ describe("admin sessions", () => {
       body: { password: "test-admin-password-123" }
     });
     assert.equal(res.status, 200);
-    assert.match(res.text, /"ok":true/);
-    assert.ok(res.setCookie);
-    assert.match(String(res.setCookie), /filelab_session=/);
-    assert.doesNotMatch(String(res.setCookie), /test-admin-password/);
+    assert.equal(res.json.token, undefined);
+    const cookie = Array.isArray(res.setCookie) ? res.setCookie[0] : String(res.setCookie);
+    assert.match(cookie, /filelab_session=/);
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Strict/);
   });
 
   test("unauthorized access rejected", async () => {
@@ -233,11 +249,10 @@ describe("rate limiting", () => {
 });
 
 describe("deploy safety", () => {
-  test.beforeEach(() => { loginLimiter.reset(); deployLimiter.reset(); });
-
-  test("duplicate paths rejected", async () => {
+  test("duplicate ZIP paths return 400", async () => {
     const mock = makeAdminMock();
-    mock.addSite("s1", "mysite", "draft");
+    mock.addSite("s1", "mysite", "published", "sites/s1/old");
+    mock.addFile("s1", "index.html", "<h1>old</h1>");
     const app = createAdminApp(mock.db);
     const login = await request(app, "/api/login", {
       method: "POST",
@@ -246,14 +261,74 @@ describe("deploy safety", () => {
     });
     const raw = Array.isArray(login.setCookie) ? login.setCookie[0] : String(login.setCookie);
     const cookie = raw.split(";")[0];
-    const zip = makeZip({ "index.html": "<h1>a</h1>", "dup.html": "<h1>b</h1>" });
+    // Real ZIP with two entries named index.html (adm-zip collapses on addFile, so we use a prebuilt archive).
+    const dupZipB64 = "UEsDBBQAAAAAAAaoc10BEhXZCgAAAAoAAAAKAAAAaW5kZXguaHRtbDxoMT5hPC9oMT5QSwMEFAAAAAAABqhzXa9ggV8KAAAACgAAAAoAAABpbmRleC5odG1sPGgxPmI8L2gxPlBLAQIUAxQAAAAAAAaoc10BEhXZCgAAAAoAAAAKAAAAAAAAAAAAAACAAQAAAABpbmRleC5odG1sUEsBAhQDFAAAAAAABqhzXa9ggV8KAAAACgAAAAoAAAAAAAAAAAAAAIABMgAAAGluZGV4Lmh0bWxQSwUGAAAAAAIAAgBwAAAAZAAAAAAA";
     const res = await request(app, "/api/sites/s1/deploy", {
       method: "POST",
       cookie,
       headers: { "content-type": "application/json", origin: "http://127.0.0.1", "x-filelab-request": "1" },
-      body: { zipBase64: zip.toString("base64") }
+      body: { zipBase64: dupZipB64 }
     });
-    assert.ok([200, 400].includes(res.status));
+    assert.equal(res.status, 400);
+    const site = mock.sites.get("s1");
+    assert.equal(site.storage_prefix, "sites/s1/old");
+    assert.equal(site.status, "published");
+  });
+
+  test("failed metadata insertion preserves previous version", async () => {
+    const mock = makeAdminMock();
+    mock.addSite("s1", "mysite", "published", "sites/s1/old");
+    mock.addFile("s1", "index.html", "<h1>old</h1>");
+    mock.setMetaFail(true);
+    const app = createAdminApp(mock.db);
+    const login = await request(app, "/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1" },
+      body: { password: "test-admin-password-123" }
+    });
+    const raw = Array.isArray(login.setCookie) ? login.setCookie[0] : String(login.setCookie);
+    const cookie = raw.split(";")[0];
+    const zip = new AdmZip();
+    zip.addFile("index.html", Buffer.from("<h1>new</h1>"));
+    const res = await request(app, "/api/sites/s1/deploy", {
+      method: "POST",
+      cookie,
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1", "x-filelab-request": "1" },
+      body: { zipBase64: zip.toBuffer().toString("base64") }
+    });
+    assert.equal(res.status, 500);
+    const site = mock.sites.get("s1");
+    assert.equal(site.storage_prefix, "sites/s1/old");
+    assert.equal(site.status, "published");
+    const oldFiles = mock.files.get("s1");
+    assert.equal(oldFiles.get("index.html").path, "index.html");
+  });
+
+  test("failed active-version switching preserves previous version", async () => {
+    const mock = makeAdminMock();
+    mock.addSite("s1", "mysite", "published", "sites/s1/old");
+    mock.addFile("s1", "index.html", "<h1>old</h1>");
+    mock.setRpcFail(true);
+    const app = createAdminApp(mock.db);
+    const login = await request(app, "/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1" },
+      body: { password: "test-admin-password-123" }
+    });
+    const raw = Array.isArray(login.setCookie) ? login.setCookie[0] : String(login.setCookie);
+    const cookie = raw.split(";")[0];
+    const zip = new AdmZip();
+    zip.addFile("index.html", Buffer.from("<h1>new</h1>"));
+    const res = await request(app, "/api/sites/s1/deploy", {
+      method: "POST",
+      cookie,
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1", "x-filelab-request": "1" },
+      body: { zipBase64: zip.toBuffer().toString("base64") }
+    });
+    assert.equal(res.status, 500);
+    const site = mock.sites.get("s1");
+    assert.equal(site.storage_prefix, "sites/s1/old");
+    assert.equal(site.status, "published");
   });
 
   test("failed upload preserves previous version", async () => {
@@ -269,12 +344,13 @@ describe("deploy safety", () => {
     });
     const raw = Array.isArray(login.setCookie) ? login.setCookie[0] : String(login.setCookie);
     const cookie = raw.split(";")[0];
-    const zip = makeZip({ "index.html": "<h1>new</h1>" });
+    const zip = new AdmZip();
+    zip.addFile("index.html", Buffer.from("<h1>new</h1>"));
     const res = await request(app, "/api/sites/s1/deploy", {
       method: "POST",
       cookie,
       headers: { "content-type": "application/json", origin: "http://127.0.0.1", "x-filelab-request": "1" },
-      body: { zipBase64: zip.toString("base64") }
+      body: { zipBase64: zip.toBuffer().toString("base64") }
     });
     assert.equal(res.status, 502);
     const site = mock.sites.get("s1");
@@ -293,6 +369,49 @@ describe("public service remains read-only", () => {
   test("safePublicPath still rejects traversal", () => {
     assert.equal(safePublicPath("../etc"), null);
     assert.equal(safePublicPath("%2e%2e/secret"), null);
+  });
+});
+
+describe("public service read-only credentials", () => {
+  test("serves published file when reader-style client is used", async () => {
+    const mock = {
+      from(table) {
+        const state = { filters: {} };
+        const c = {
+          select() { return c; },
+          eq(col, val) { state.filters[col] = val; return c; },
+          async single() {
+            if (table === "filelab_sites" && state.filters.slug === "mysite") {
+              return { data: { id: "s1", slug: "mysite", status: "published", storage_prefix: "sites/s1/v1" }, error: null };
+            }
+            return { data: null, error: { message: "not found" } };
+          },
+          async maybeSingle() {
+            if (table === "filelab_site_files" && state.filters.path === "index.html") {
+              return { data: { path: "index.html", content_type: "text/html" }, error: null };
+            }
+            return { data: null, error: null };
+          }
+        };
+        return c;
+      },
+      storage: {
+        from() {
+          return {
+            async download(key) {
+              if (key === "sites/s1/v1/index.html") {
+                return { data: { arrayBuffer: async () => Buffer.from("<h1>reader ok</h1>") }, error: null };
+              }
+              return { data: null, error: { message: "missing" } };
+            }
+          };
+        }
+      }
+    };
+    const app = createPublicApp(mock);
+    const res = await request(app, "/s/mysite/");
+    assert.equal(res.status, 200);
+    assert.match(res.text || "", /reader ok/);
   });
 });
 

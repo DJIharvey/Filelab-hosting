@@ -31,8 +31,23 @@ function makeLimiter(windowMs, max) {
 const loginLimiter = makeLimiter(15 * 60 * 1000, 5);
 const deployLimiter = makeLimiter(60 * 60 * 1000, 10);
 
+// Only trust X-Forwarded-For when explicitly enabled (Render sets this correctly).
+// Set TRUST_PROXY=1 on Render. Do not trust arbitrary client-supplied X-Forwarded-For.
+const TRUST_PROXY = process.env.TRUST_PROXY === "1" || process.env.TRUST_PROXY === "true";
+
 function clientIp(req) {
-  return (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  if (TRUST_PROXY) {
+    // Rightmost address is the closest proxy; the leftmost is the original client
+    // when the platform appends. On Render, X-Forwarded-For is set by the platform.
+    const xff = req.headers["x-forwarded-for"];
+    if (xff) {
+      const parts = String(xff).split(",").map(s => s.trim()).filter(Boolean);
+      // Use the leftmost (original client) only because we trust the platform proxy.
+      if (parts.length) return parts[0];
+    }
+  }
+  // Fallback: direct connection address. Ignore client-supplied X-Forwarded-For.
+  return req.socket?.remoteAddress || "unknown";
 }
 
 function logError(msg, err) {
@@ -178,6 +193,8 @@ export function createAdminApp(dbClient) {
     const siteRes = await db.from("filelab_sites").select("id,slug,storage_prefix,status").eq("id", req.params.id).single();
     if (siteRes.error || !siteRes.data) return res.status(404).json({ error: "Site not found" });
     const site = siteRes.data;
+    const previousPrefix = site.storage_prefix;
+    const previousStatus = site.status;
 
     let entries;
     try { entries = new AdmZip(buf).getEntries(); } catch { return res.status(400).json({ error: "Cannot read ZIP" }); }
@@ -201,7 +218,8 @@ export function createAdminApp(dbClient) {
     if (!files.length || files.length > MAX_FILES) return res.status(400).json({ error: "ZIP must contain 1–1,500 files" });
     if (!files.some(f => f.path.toLowerCase() === "index.html")) return res.status(400).json({ error: "Put index.html at the ZIP root" });
 
-    const prefix = site.storage_prefix + "/v-" + Date.now() + "-" + crypto.randomBytes(3).toString("hex");
+    // New version prefix — never overwrites the active prefix until the atomic switch.
+    const prefix = (site.storage_prefix || ("sites/" + site.id)) + "/v-" + Date.now() + "-" + crypto.randomBytes(3).toString("hex");
     const uploaded = [];
     try {
       for (const f of files) {
@@ -218,42 +236,31 @@ export function createAdminApp(dbClient) {
       return res.status(502).json({ error: "Upload failed. Previous version preserved." });
     }
 
-    const rows = files.map(f => ({
-      site_id: site.id,
+    const fileMeta = files.map(f => ({
       path: f.path,
       content_type: mime.lookup(f.path) || "application/octet-stream",
       size_bytes: f.data.length
     }));
 
-    const del = await db.from("filelab_site_files").delete().eq("site_id", site.id);
-    if (del.error) {
-      logError("deploy delete old meta", del.error);
-      try { await db.storage.from(BUCKET).remove(uploaded); } catch { /* */ }
-      return res.status(500).json({ error: "Could not update site. Previous version preserved." });
-    }
+    // Atomic switch: one RPC updates metadata and active prefix together.
+    // If this fails, the previous deployment (prefix + filelab_site_files) stays fully intact.
+    const rpc = await db.rpc("filelab_activate_deployment", {
+      p_site_id: site.id,
+      p_storage_prefix: prefix,
+      p_files: fileMeta,
+      p_file_count: files.length,
+      p_total_bytes: total
+    });
 
-    const ins = await db.from("filelab_site_files").insert(rows);
-    if (ins.error) {
-      logError("deploy insert meta", ins.error);
+    if (rpc.error) {
+      logError("deploy activate", rpc.error);
       try { await db.storage.from(BUCKET).remove(uploaded); } catch { /* */ }
-      return res.status(500).json({ error: "Could not update site. Previous version preserved." });
-    }
-
-    const up = await db.from("filelab_sites").update({
-      storage_prefix: prefix,
-      file_count: files.length,
-      total_bytes: total,
-      status: "published",
-      deployed_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    }).eq("id", site.id);
-    if (up.error) {
-      logError("deploy update site", up.error);
+      // Ensure we did not leave the site pointing at the failed version.
       return res.status(500).json({ error: "Could not activate deployment. Previous version preserved." });
     }
 
     const url = publicUrl(site.slug);
-    res.json({ ok: true, files: files.length, bytes: total, url, publicUrl: url });
+    res.json({ ok: true, files: files.length, bytes: total, url, publicUrl: url, storagePrefix: prefix, previousPrefix });
   });
 
   return app;
