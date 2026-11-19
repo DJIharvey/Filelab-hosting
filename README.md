@@ -12,7 +12,7 @@ FileLab owns website uploads, publishing records, and public site serving. There
 - Mutating requests require a same-origin `Origin` header or `X-FileLab-Request: 1` (CSRF protection).
 - Login is rate-limited (5 attempts / 15 min per IP). Deploy is rate-limited (10 / hour per IP). Limits are in-memory, reset on process restart, and are not shared across instances.
 - On Render set `TRUST_PROXY=1` so the platform-provided `X-Forwarded-For` is used. Arbitrary client-supplied `X-Forwarded-For` values are ignored when `TRUST_PROXY` is unset.
-- Deployments are versioned. All new files are uploaded and validated first. The active version is switched with a single database RPC (`filelab_activate_deployment`). If any step fails, the previous deployment (metadata + files) remains fully accessible.
+- Deployments are versioned. All new files are uploaded and validated first. The active version is switched with a single database RPC (`filelab_activate_deployment`). If any step fails, the previous deployment (metadata + files) remains fully accessible. Concurrent deploys of the same site are serialized by a row lock.
 - Admin dashboard has a strict Content-Security-Policy. Public sites do not inherit it.
 - Internal Supabase errors are not returned to clients.
 - The public service never exposes credentials to the browser. Recommended: use `SUPABASE_SERVICE_ROLE_KEY` server-side only. Optional: `SUPABASE_READER_KEY` (see migration notes). The `filelab-sites` bucket stays private.
@@ -35,20 +35,31 @@ FileLab owns website uploads, publishing records, and public site serving. There
 Do not make the `filelab-sites` bucket public. Do not put any key in frontend code.
 
 ### Generating SUPABASE_READER_KEY (optional)
-Supabase does not automatically issue a JWT for a custom role. To use a restricted key:
+Supabase does not automatically issue a JWT for a custom role. The `filelab_reader` role has SELECT on metadata tables only. It does **not** receive Storage permissions, and this has not been verified with live Supabase Storage credentials. The public service still downloads private-bucket objects with a server-side key.
 
-1. Run `supabase/migrations/20261119_filelab_reader_role.sql` in the SQL editor.
-2. Create a JWT signed with your project's JWT secret (Dashboard → Project Settings → API → JWT Secret) whose payload includes `"role": "filelab_reader"`.
-3. Set `SUPABASE_READER_KEY` to that JWT on the public service only.
+To use a restricted metadata key:
 
-If you skip this, leave `SUPABASE_READER_KEY` unset and use `SUPABASE_SERVICE_ROLE_KEY` on the public service. The bucket remains private either way; the public process is the only reader.
+1. Run `supabase/migrations/20261119_atomic_deployments.sql` first.
+2. Run `supabase/migrations/20261119_filelab_reader_role.sql`.
+3. Create a JWT signed with your project's JWT secret (Dashboard → Project Settings → API → JWT Secret) whose payload includes `"role": "filelab_reader"`.
+4. Set `SUPABASE_READER_KEY` to that JWT on the public service only.
+
+If you skip this, leave `SUPABASE_READER_KEY` unset and use `SUPABASE_SERVICE_ROLE_KEY` on the public service (server-side only). The bucket remains private either way.
 
 ## Supabase migrations
 
-1. `supabase/migrations/20261119_filelab_reader_role.sql` — optional read-only role (SELECT on metadata only).
-2. `supabase/migrations/20261119_atomic_deployments.sql` — **required** for atomic deploys. Creates `filelab_deployments` and the `filelab_activate_deployment` RPC. Additive; does not drop existing data.
+Run in this order in the Supabase SQL editor:
 
-The public service reads published site metadata and file rows, then downloads objects from the private bucket using the server-side key. No browser code ever sees the key.
+1. **Required first:** `supabase/migrations/20261119_atomic_deployments.sql`
+   - Creates `filelab_deployments`.
+   - Creates `filelab_activate_deployment` (locks the site row, then switches metadata and `storage_prefix` in one transaction).
+   - Additive. Assumes existing `filelab_sites` and `filelab_site_files` from the original setup.
+2. **Optional second:** `supabase/migrations/20261119_filelab_reader_role.sql`
+   - Creates the read-only metadata role.
+   - Grants SELECT on `filelab_deployments` only if that table already exists, so either order is safe, but the documented order is atomic first.
+   - Does **not** grant Storage access. The bucket stays private.
+
+The public service reads published site metadata and file rows, then downloads objects from the private bucket using the server-side key. No browser code ever sees the key. Concurrent deploys of the same site are serialized by `SELECT ... FOR UPDATE` inside the activation function.
 
 ## Local development
 

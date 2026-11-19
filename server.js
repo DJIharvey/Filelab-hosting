@@ -242,8 +242,9 @@ export function createAdminApp(dbClient) {
       size_bytes: f.data.length
     }));
 
-    // Atomic switch: one RPC updates metadata and active prefix together.
-    // If this fails, the previous deployment (prefix + filelab_site_files) stays fully intact.
+    // Atomic, serialized switch: the RPC locks the site row (FOR UPDATE),
+    // then replaces metadata and storage_prefix in one transaction.
+    // Concurrent deploys of the same site wait; failure leaves the previous version intact.
     const rpc = await db.rpc("filelab_activate_deployment", {
       p_site_id: site.id,
       p_storage_prefix: prefix,
